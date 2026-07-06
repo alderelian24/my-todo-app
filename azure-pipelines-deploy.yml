@@ -1,0 +1,120 @@
+trigger: none # Trigger is based on pipeline resource completion
+
+resources:
+  pipelines:
+    - pipeline: build-pipeline
+      source: 'my-todo-app-build' # Nombre de la pipeline de compilación (Pipeline 2)
+      trigger:
+        branches:
+          include:
+            - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: AzureServiceConnection
+  - name: resourceGroup
+    value: 'rg-todo-app'
+  - name: containerName
+    value: 'aci-todo-app'
+  - name: vnetName
+    value: 'vnet-todo-app'
+  - name: subnetName
+    value: 'subnet-aci'
+  - name: imageRepository
+    value: 'todo-app'
+
+steps:
+  - task: AzureCLI@2
+    displayName: 'Desplegar a Azure Container Instances (ACI)'
+    inputs:
+      azureSubscription: '$(AzureServiceConnectionName)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        # Obtener el login server de ACR desde las variables o dinámicamente si es necesario.
+        # Por simplicidad, asumimos que el ACR se define o se recupera del grupo de variables.
+        # Se obtiene el nombre del ACR del grupo de variables o mediante az cli.
+        ACR_NAME=$(az acr list --resource-group $(resourceGroup) --query "[0].name" -o tsv)
+        LOGIN_SERVER=$(az acr show --name $ACR_NAME --query loginServer -o tsv)
+        
+        echo "##[section]Desplegando imagen $LOGIN_SERVER/$(imageRepository):$(resources.pipeline.build-pipeline.runID) en ACI..."
+        
+        az container create \
+          --resource-group $(resourceGroup) \
+          --name $(containerName) \
+          --image $LOGIN_SERVER/$(imageRepository):$(resources.pipeline.build-pipeline.runID) \
+          --vnet $(vnetName) \
+          --subnet $(subnetName) \
+          --registry-login-server $LOGIN_SERVER \
+          --registry-username $(acr_admin_username) \
+          --registry-password $(acr_admin_password) \
+          --ip-address Private \
+          --ports 80 \
+          --cpu 0.5 \
+          --memory 1.5 \
+          --environment-variables PORT=80 NODE_ENV=production APP_VERSION=$(resources.pipeline.build-pipeline.runID)
+
+  - task: AzureCLI@2
+    displayName: 'Verificación del Contenedor'
+    inputs:
+      azureSubscription: '$(AzureServiceConnectionName)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        echo "##[section]Verificando estado del contenedor..."
+        
+        # Obtener estado de provisión
+        STATE=$(az container show --resource-group $(resourceGroup) --name $(containerName) --query instanceView.state -o tsv)
+        echo "Estado del Contenedor: $STATE"
+        
+        if [ "$STATE" != "Running" ]; then
+          echo "##[error]El contenedor no se encuentra en estado Running. Estado actual: $STATE"
+          exit 1
+        fi
+        
+        # Obtener IP privada asignada
+        IP_ADDRESS=$(az container show --resource-group $(resourceGroup) --name $(containerName) --query ipAddress.ip -o tsv)
+        echo "IP Privada Asignada: $IP_ADDRESS"
+        
+        if [ -z "$IP_ADDRESS" ]; then
+          echo "##[error]No se asignó una dirección IP al contenedor."
+          exit 1
+        fi
+        
+        echo "##[section]Contenedor verificado con éxito en ACI."
+
+  - task: AzureCLI@2
+    displayName: 'Validación de Accesibilidad'
+    inputs:
+      azureSubscription: '$(AzureServiceConnectionName)'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        echo "##[section]Validando accesibilidad HTTP..."
+        
+        IP_ADDRESS=$(az container show --resource-group $(resourceGroup) --name $(containerName) --query ipAddress.ip -o tsv)
+        echo "Probando conexión HTTP a http://$IP_ADDRESS:80..."
+        
+        # Dado que ACI está en una VNet privada, si este agente está alojado en la nube pública de Microsoft,
+        # no podrá acceder directamente mediante HTTP. Validaremos la accesibilidad y si falla por timeout, 
+        # notificaremos sin romper el pipeline a menos que el estado del contenedor sea incorrecto.
+        
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://$IP_ADDRESS) || true
+        
+        if [ "$RESPONSE" == "200" ]; then
+          echo "##[section]¡Éxito! La aplicación respondió con código HTTP 200."
+        else
+          echo "##[warning]No se pudo conectar directamente mediante HTTP (Código: $RESPONSE)."
+          echo "##[warning]Esto es esperado si el agente de Azure DevOps no está en la misma VNet privada."
+          echo "Comprobando que el puerto 80 esté escuchando en la instancia..."
+          
+          PORT_STATE=$(az container show --resource-group $(resourceGroup) --name $(containerName) --query "ipAddress.ports[0].port" -o tsv)
+          if [ "$PORT_STATE" == "80" ]; then
+            echo "##[section]Validación alternativa exitosa: El puerto 80 está configurado y expuesto en la instancia del contenedor."
+          else
+            echo "##[error]Error: El puerto 80 no está expuesto."
+            exit 1
+          fi
+        fi

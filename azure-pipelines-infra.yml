@@ -1,0 +1,43 @@
+trigger: none # Trigger manual
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: AzureServiceConnection
+  - name: terraformWorkingDirectory
+    value: '$(System.DefaultWorkingDirectory)/azure-infra'
+
+steps:
+  - task: TerraformInstaller@1
+    displayName: 'Instalar Terraform'
+    inputs:
+      terraformVersion: 'latest'
+
+  - task: TerraformTaskV4@4
+    displayName: 'Terraform Init'
+    inputs:
+      provider: 'azurerm'
+      command: 'init'
+      workingDirectory: '$(terraformWorkingDirectory)'
+      backendServiceArm: '$(AzureServiceConnectionName)'
+      backendAzureRmResourceGroupName: '$(TerraformBackendResourceGroup)'
+      backendAzureRmStorageAccountName: '$(TerraformBackendStorageAccount)'
+      backendAzureRmContainerName: '$(TerraformBackendContainerName)'
+      backendAzureRmKey: '$(TerraformBackendKey)'
+
+  - task: TerraformTaskV4@4
+    displayName: 'Terraform Plan'
+    inputs:
+      provider: 'azurerm'
+      command: 'plan'
+      workingDirectory: '$(terraformWorkingDirectory)'
+      environmentServiceNameAzureRM: '$(AzureServiceConnectionName)'
+
+  - task: TerraformTaskV4@4
+    displayName: 'Terraform Apply'
+    inputs:
+      provider: 'azurerm'
+      command: 'apply'
+      workingDirectory: '$(terraformWorkingDirectory)'
+      environmentServiceNameAzureRM: '$(AzureServiceConnectionName)'
